@@ -1,0 +1,486 @@
+---
+title: "survival"
+output: html_document
+date: "2026-08-26"
+---
+
+Conducting univariable and multivariable cox models for survival 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(haven)
+library(dplyr)
+library(survival)
+library(gtsummary)
+library(officer)
+library(flextable)
+```
+
+```{r}
+retro_update6 <- read_sas(
+  "sas_datafiles/retro_update6.sas7bdat"
+)
+
+```
+
+```{r}
+admin_end <- as.Date("2023-12-31")
+
+analysis_complete <- retro_update6 %>%
+  filter(vitalstatus %in% c(0, 1)) %>%
+  mutate(
+    # End of follow-up, defined consistently with the SMR analysis
+followup_end = pmin(
+  coalesce(DOD, admin_end),
+  LastFU,
+  admin_end,
+  na.rm = TRUE
+),
+
+# Survival time from birth to end of follow-up
+followup_years_birth =
+  as.numeric(followup_end - DOB) / 365,
+
+
+# count a death as an event only if it occurred during observed follow-up
+death = if_else(
+  vitalstatus == 1 &
+    !is.na(DOD) &
+    DOD == followup_end,
+  1,
+  0
+),
+
+    # BMI = kg / m^2
+    BMI = peso_medio / (altezza_media / 100)^2,
+
+# Number of official games, scaled per 50 games
+games_50 = presenze_totali / 50,
+
+    # Recode position labels
+    position_clean = case_when(
+      position == "" | is.na(position) ~ NA_character_,
+      grepl("^forw", position, ignore.case = TRUE) ~ "Forward",
+      grepl("^mid", position, ignore.case = TRUE) ~ "Midfielder",
+      grepl("^def", position, ignore.case = TRUE) ~ "Defender",
+      grepl("^goal", position, ignore.case = TRUE) ~ "Goalkeeper",
+      grepl("^multi", position, ignore.case = TRUE) ~ "Multi role",
+      TRUE ~ position
+    ),
+
+    # Forward as reference category, matching Matt's table
+    position_clean = factor(
+      position_clean,
+      levels = c(
+        "Forward",
+        "Midfielder",
+        "Defender",
+        "Goalkeeper",
+        "Multi role"
+      )
+    )
+  )
+
+# QC before modeling
+analysis_complete %>%
+  summarise(
+    n = n(),
+    deaths = sum(death),
+
+    missing_DOB = sum(is.na(DOB)),
+    missing_followup_end = sum(is.na(followup_end)),
+    missing_followup = sum(is.na(followup_years_birth)),
+
+    negative_followup =
+      sum(followup_years_birth < 0, na.rm = TRUE),
+
+    followup_after_admin_end =
+      sum(followup_end > admin_end, na.rm = TRUE),
+
+    deaths_end_not_DOD =
+      sum(
+        vitalstatus == 1 &
+          followup_end != DOD,
+        na.rm = TRUE
+      ),
+
+    negative_career_length =
+      sum(CareerLength < 0, na.rm = TRUE),
+
+    missing_BMI = sum(is.na(BMI)),
+    missing_career = sum(is.na(CareerLength)),
+    missing_games = sum(is.na(presenze_totali)),
+    missing_position = sum(is.na(position_clean))
+  ) %>%
+  print(width = Inf)
+```
+
+# cox models 
+```{r}
+# Univariable Cox proportional hazards models
+
+# BMI
+cox_bmi <- coxph(
+  Surv(followup_years_birth, death) ~ BMI,
+  data = analysis_complete
+)
+
+# Length of professional career
+cox_career <- coxph(
+  Surv(followup_years_birth, death) ~ CareerLength,
+  data = analysis_complete
+)
+
+# Number of official games played
+cox_games <- coxph(
+  Surv(followup_years_birth, death) ~ games_50,
+  data = analysis_complete
+)
+
+# Position
+cox_position <- coxph(
+  Surv(followup_years_birth, death) ~ position_clean,
+  data = analysis_complete
+)
+
+
+# View model results
+summary(cox_bmi)
+summary(cox_career)
+summary(cox_games)
+summary(cox_position)
+
+# Check proportional hazards assumption
+cox.zph(cox_bmi)
+cox.zph(cox_career)
+cox.zph(cox_games)
+cox.zph(cox_position)
+
+
+# Create publication-style univariable table
+# Clean univariable Cox regression table
+tbl_univariable <- analysis_complete %>%
+  select(
+  followup_years_birth,
+  death,
+  BMI,
+  CareerLength,
+  games_50,
+  position_clean
+) %>%
+  tbl_uvregression(
+    method = coxph,
+    y = Surv(followup_years_birth, death),
+    include = c(
+  BMI,
+  CareerLength,
+  games_50,
+  position_clean
+),
+    exponentiate = TRUE,
+    label = list(
+      BMI ~ "BMI (kg/m²)",
+      CareerLength ~ "Length of career (years)",
+      games_50 ~ "No. of official games played (per 50 games)",
+      position_clean ~ "Position"
+    )
+  ) %>%
+  add_global_p(
+  include = position_clean
+) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        label = if_else(
+          label == "Forward",
+          "Forward (Reference)",
+          label
+        )
+      )
+  ) %>%
+ modify_header(
+  label ~ "**Variable**",
+  estimate ~ "**Hazard Ratio**",
+  conf.low ~ "**95% CI**",
+  p.value ~ "**P-value**"
+)
+
+tbl_univariable
+```
+
+# save to word 
+```{r}
+# save univariable analysis table to Word
+
+dir.create("results", showWarnings = FALSE)
+
+ft_univariable <- tbl_univariable |>
+  as_flex_table() |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+doc <- read_docx() |>
+  body_add_par("Univariable Cox Regression Analyses", style = "Normal") |>
+  body_add_flextable(ft_univariable)
+
+# print(
+#   doc,
+#   target = "results/univariable_cox_regression_table.docx"
+# )
+```
+
+
+
+
+
+
+
+# multivariable models
+```{r}
+# ============================================================
+# MULTIVARIABLE COX PROPORTIONAL HAZARDS MODELS
+# Survival time measured FROM BIRTH
+# ============================================================
+
+library(lubridate)
+
+# Add age/year at beginning of professional career
+analysis_complete <- analysis_complete %>%
+  mutate(
+    # Beginning of professional career
+    # defined as June 15 of esordio year
+    career_start_date = as.Date(
+      paste0(esordio, "-06-15")
+    ),
+
+    # Year professional career began
+    career_start_year = esordio,
+
+    # Age at beginning of professional career
+    age_start_career =
+      as.numeric(career_start_date - DOB) / 365.25
+  )
+
+
+# ------------------------------------------------------------
+# QC
+# ------------------------------------------------------------
+
+analysis_complete %>%
+  summarise(
+    n = n(),
+    deaths = sum(death, na.rm = TRUE),
+
+    missing_BMI = sum(is.na(BMI)),
+    missing_position = sum(is.na(position_clean)),
+    missing_age_start_career = sum(is.na(age_start_career)),
+    missing_career_start_year = sum(is.na(career_start_year)),
+    missing_games_50 = sum(is.na(games_50)),
+    missing_CareerLength = sum(is.na(CareerLength)),
+
+    min_age_start_career =
+      min(age_start_career, na.rm = TRUE),
+
+    max_age_start_career =
+      max(age_start_career, na.rm = TRUE),
+
+    min_career_start_year =
+      min(career_start_year, na.rm = TRUE),
+
+    max_career_start_year =
+      max(career_start_year, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+
+
+# ============================================================
+# MODEL 1
+# BMI + position + age at beginning of career +
+# year beginning career + games played per 50
+# ============================================================
+
+cox_multi_1 <- coxph(
+  Surv(followup_years_birth, death) ~
+    BMI +
+    position_clean +
+    age_start_career +
+    career_start_year +
+    games_50,
+  data = analysis_complete
+)
+
+summary(cox_multi_1)
+
+
+# ============================================================
+# MODEL 2
+# BMI + position + age at beginning of career +
+# year beginning career + career length
+# ============================================================
+
+cox_multi_2 <- coxph(
+  Surv(followup_years_birth, death) ~
+    BMI +
+    position_clean +
+    age_start_career +
+    career_start_year +
+    CareerLength,
+  data = analysis_complete
+)
+
+summary(cox_multi_2)
+
+
+# ------------------------------------------------------------
+# Proportional hazards assumption
+# ------------------------------------------------------------
+
+cox.zph(cox_multi_1)
+cox.zph(cox_multi_2)
+
+
+# ------------------------------------------------------------
+# Publication-style table: Model 1
+# ------------------------------------------------------------
+
+tbl_multi_1 <- tbl_regression(
+  cox_multi_1,
+  exponentiate = TRUE,
+  label = list(
+    BMI ~ "BMI (kg/m²)",
+    position_clean ~ "Position",
+    age_start_career ~ "Age at beginning of career (years)",
+    career_start_year ~ "Year of beginning of career",
+    games_50 ~ "No. of official games played (per 50 games)"
+  )
+) %>%
+  add_global_p(
+    include = position_clean
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        label = if_else(
+          label == "Forward",
+          "Forward (Reference)",
+          label
+        )
+      )
+  ) %>%
+  modify_header(
+    label ~ "**Variable**",
+    estimate ~ "**Hazard Ratio**",
+    conf.low ~ "**95% CI**",
+    p.value ~ "**P-value**"
+  )
+
+
+tbl_multi_2 <- tbl_regression(
+  cox_multi_2,
+  exponentiate = TRUE,
+  label = list(
+    BMI ~ "BMI (kg/m²)",
+    position_clean ~ "Position",
+    age_start_career ~ "Age at beginning of career (years)",
+    career_start_year ~ "Year of beginning of career",
+    CareerLength ~ "Length of career (years)"
+  )
+) %>%
+  add_global_p(
+    include = position_clean
+  ) %>%
+  modify_table_body(
+    ~ .x %>%
+      mutate(
+        label = if_else(
+          label == "Forward",
+          "Forward (Reference)",
+          label
+        )
+      )
+  ) %>%
+  modify_header(
+    label ~ "**Variable**",
+    estimate ~ "**Hazard Ratio**",
+    conf.low ~ "**95% CI**",
+    p.value ~ "**P-value**"
+  )
+
+
+# View tables
+tbl_multi_1
+tbl_multi_2
+
+
+# ------------------------------------------------------------
+# Combine Model 1 and Model 2 side-by-side
+# ------------------------------------------------------------
+
+tbl_multivariable_combined <- tbl_merge(
+  tbls = list(
+    tbl_multi_1,
+    tbl_multi_2
+  ),
+  tab_spanner = c(
+    "**Model 1: Total games**",
+    "**Model 2: Career length**"
+  )
+)
+
+tbl_multivariable_combined
+```
+
+# save combined models table as word
+```{r}
+dir.create("results", showWarnings = FALSE)
+
+# Convert the final side-by-side gtsummary table to flextable
+ft_multivariable <- tbl_multivariable_combined |>
+  as_flex_table() |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+# Landscape page setup because the two-model table is wide
+landscape_section <- prop_section(
+  page_size = page_size(orient = "landscape"),
+  page_margins = page_mar(
+    top = 0.5,
+    bottom = 0.5,
+    left = 0.5,
+    right = 0.5
+  )
+)
+
+# Create Word document
+doc_multivariable <- read_docx() |>
+  body_add_par(
+    "Multivariable Cox Regression Analyses",
+    style = "Normal"
+  ) |>
+  body_add_flextable(ft_multivariable) |>
+  body_set_default_section(
+    value = landscape_section
+  )
+
+# # Save
+# print(
+#   doc_multivariable,
+#   target = "results/multivariable_cox_regression_table.docx"
+# )
+```
+
