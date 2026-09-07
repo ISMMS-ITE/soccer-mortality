@@ -1,0 +1,177 @@
+---
+title: "follow_up_from_birth"
+output: html_document
+date: "2026-08-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(haven)
+library(dplyr)
+library(gtsummary)
+```
+
+# load retro update 6
+```{r}
+retro_update6 <- read_sas("sas_datafiles/retro_update6.sas7bdat")
+```
+
+# reconstruct descriptive follow-up variables 
+```{r}
+admin_end <- as.Date("2023-12-31")
+
+
+table1_data <- retro_update6 %>%
+  mutate(
+    followup_end = pmin(
+      coalesce(DOD, admin_end),
+      LastFU,
+      admin_end,
+      na.rm = TRUE
+    ),
+    person_years_birth_to_fu =
+      as.numeric(followup_end - DOB) / 365,
+
+    # Age at end of follow-up
+    age_end_fu =
+      as.numeric(followup_end - DOB) / 365,
+
+    position = case_when(
+      position == "" | is.na(position) ~ "Unknown",
+      grepl("^forw", position, ignore.case = TRUE) ~ "Forward",
+      grepl("^mid", position, ignore.case = TRUE) ~ "Midfielder",
+      grepl("^def", position, ignore.case = TRUE) ~ "Defender",
+      grepl("^goal", position, ignore.case = TRUE) ~ "Goalkeeper",
+      grepl("^multi", position, ignore.case = TRUE) ~ "Multi role",
+      TRUE ~ position
+    ),
+
+    position = factor(
+      position,
+      levels = c(
+        "Forward",
+        "Midfielder",
+        "Defender",
+        "Goalkeeper",
+        "Multi role",
+        "Unknown"
+      )
+    ),
+
+    followup_group = factor(
+      vitalstatus,
+      levels = c(0, 2, 1),
+      labels = c(
+        "Players who were alive at the end of follow-up",
+        "Players with partial follow-up",
+        "Players who died during follow-up"
+      )
+    )
+  )
+```
+
+# sumamry table
+```{r}
+tbl1 <- table1_data %>%
+  select(
+  age_end_fu,
+  person_years_birth_to_fu,
+  presenze_totali,
+  CareerLength,
+  altezza_media,
+  peso_medio,
+  position,
+  followup_group
+) %>%
+  tbl_summary(
+    by = followup_group,
+
+    type = list(
+      position ~ "categorical",
+      c(
+        age_end_fu,
+        person_years_birth_to_fu,
+        presenze_totali,
+        CareerLength,
+        altezza_media,
+        peso_medio
+      ) ~ "continuous"
+    ),
+
+    statistic = list(
+      position ~ "{n} ({p}%)",
+
+      c(
+        age_end_fu,
+        presenze_totali,
+        CareerLength,
+        altezza_media,
+        peso_medio
+      ) ~ "{mean} ± {sd}",
+
+      person_years_birth_to_fu ~ "{sum}"
+    ),
+
+    digits = list(
+      position ~ c(0, 2),
+      age_end_fu ~ 2,
+      person_years_birth_to_fu ~ 2,
+      presenze_totali ~ 2,
+      CareerLength ~ 2,
+      altezza_media ~ 2,
+      peso_medio ~ 2
+    ),
+
+    label = list(
+      position ~ "Position played in the professional team",
+      age_end_fu ~ "Age at end of follow-up (years)",
+      person_years_birth_to_fu ~ "Follow-up (person-years from birth)",
+      presenze_totali ~ "No. official games played in professional career",
+      CareerLength ~ "Length of professional career (years)",
+      altezza_media ~ "Average height (cm)",
+      peso_medio ~ "Average weight (kg)"
+    ),
+
+    missing = "no"
+  ) %>%
+  modify_header(
+    label ~ "**Characteristic**",
+    all_stat_cols() ~ "**{level}**  \nN = {n}"
+  ) %>%
+  bold_labels()
+
+tbl1
+```
+
+
+# save to word doc 
+```{r}
+# save player summary table to Word
+library(flextable)
+library(officer)
+dir.create("results", showWarnings = FALSE)
+
+ft_table1 <- tbl1 |>
+  as_flex_table() |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+doc <- read_docx() |>
+  body_add_par("Player Characteristics", style = "Normal") |>
+  body_add_flextable(ft_table1)
+
+# print(
+#   doc,
+#   target = "results/player_summary_table.docx"
+# )
+```
+
