@@ -1,0 +1,3860 @@
+---
+title: "SMR"
+output: html_document
+date: "2026-08-27"
+---
+
+Calculating COD-stratified SMR
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(haven)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(readxl)
+library(flextable)
+library(officer)
+library(ggplot2)
+```
+
+# laod cohort data 
+```{r}
+retro_update6 <- read_sas(
+  "sas_datafiles/retro_update6.sas7bdat"
+)
+
+italy_ref = read.csv("sas_datafiles/Italy_Overall_Deaths.csv")
+
+admin_end <- as.Date("2023-12-31")
+ref_start <- as.Date("1975-01-01")
+```
+
+# define the full follow up cohort and end of follow up 
+```{r}
+# Full-follow-up cohort:
+# vitalstatus 0 = alive
+# vitalstatus 1 = died
+# vitalstatus 2 = partial follow-up
+
+full_fu <- retro_update6 %>%
+  filter(vitalstatus %in% c(0, 1)) %>%
+  mutate(
+    # End of observed follow-up:
+    # earliest of death, LastFU, or administrative study end
+    analysis_end = pmin(
+      coalesce(DOD, admin_end),
+      LastFU,
+      admin_end,
+      na.rm = TRUE
+    )
+  )
+
+# QC
+full_fu %>%
+  summarise(
+    n_players = n(),
+    n_alive = sum(vitalstatus == 0),
+    n_deaths = sum(vitalstatus == 1),
+
+    missing_DOB = sum(is.na(DOB)),
+    missing_LastFU = sum(is.na(LastFU)),
+    missing_analysis_end = sum(is.na(analysis_end)),
+
+    missing_DOD_among_deaths =
+      sum(vitalstatus == 1 & is.na(DOD)),
+
+    deaths_end_not_DOD =
+      sum(
+        vitalstatus == 1 &
+          analysis_end != DOD,
+        na.rm = TRUE
+      ),
+
+    analysis_end_after_2023 =
+      sum(
+        analysis_end > admin_end,
+        na.rm = TRUE
+      ),
+
+    analysis_end_before_DOB =
+      sum(
+        analysis_end < DOB,
+        na.rm = TRUE
+      )
+  ) %>%
+  print(width = Inf)
+```
+
+# define the SMR-eligible start of follow up 
+# because the italian reference data begin at age 15 and in 1975, each palyer can only begin contributing SMR person-time at the later of: 
+# 1. his 15th birthday, or 
+# 2. January 1, 1975
+
+# also, census data goes until 89 so make sure not to include anyone age 90+, but we don't have anyone
+```{r}
+# Define start of SMR-eligible follow-up
+
+full_fu <- full_fu %>%
+  mutate(
+    # 15th birthday, with Feb 29 handled explicitly
+    fifteenth_birthday = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(DOB) + 15),
+
+        paste0(year(DOB) + 15, "-02-28"),
+
+        paste0(
+          year(DOB) + 15, "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    # SMR follow-up begins only once both conditions are met:
+    # age >= 15 and calendar year >= 1975
+    smr_start = pmax(
+      fifteenth_birthday,
+      ref_start,
+      na.rm = TRUE
+    ),
+
+    smr_followup_days =
+      as.numeric(analysis_end - smr_start),
+
+    smr_followup_py =
+      smr_followup_days / 365
+  )
+
+# QC
+full_fu %>%
+  summarise(
+    missing_fifteenth_birthday =
+      sum(is.na(fifteenth_birthday)),
+
+    missing_smr_start =
+      sum(is.na(smr_start)),
+
+    smr_start_before_age15 =
+      sum(
+        smr_start < fifteenth_birthday,
+        na.rm = TRUE
+      ),
+
+    smr_start_before_1975 =
+      sum(
+        smr_start < ref_start,
+        na.rm = TRUE
+      ),
+
+    zero_or_negative_smr_followup =
+      sum(
+        smr_followup_days <= 0,
+        na.rm = TRUE
+      ),
+
+    total_unsplit_smr_person_years =
+      sum(smr_followup_py, na.rm = TRUE)
+  )
+```
+
+# define the age and calendar strata 
+```{r}
+# Define age and calendar strata to match Italian reference data
+
+age_breaks <- c(
+  15, 20, 25, 30, 35, 40, 45, 50,
+  55, 60, 65, 70, 75, 80, 85, 90
+)
+
+age_labels <- c(
+  19, 24, 29, 34, 39, 44, 49, 54,
+  59, 64, 69, 74, 79, 84, 89
+)
+
+calendar_breaks <- as.Date(c(
+  "1975-01-01",
+  "1980-01-01",
+  "1985-01-01",
+  "1990-01-01",
+  "1995-01-01",
+  "2000-01-01",
+  "2005-01-01",
+  "2010-01-01",
+  "2015-01-01",
+  "2020-01-01",
+  "2024-01-01"
+))
+
+calendar_labels <- c(
+  1979, 1984, 1989, 1994, 1999,
+  2004, 2009, 2014, 2019, 2023
+)
+
+```
+
+# split each player's follow-up at age and calendar boundaries 
+```{r}
+# Split each player's SMR-eligible follow-up at
+# attained-age and calendar-period boundaries
+
+make_split_points <- function(dob, start_date, end_date) {
+
+  # Birthdays where a new 5-year age category begins
+  cut_ages <- seq(20, 90, by = 5)
+  target_years <- year(dob) + cut_ages
+
+  # Construct age-boundary dates
+  if (format(dob, "%m-%d") == "02-29") {
+
+    age_cut_dates <- as.Date(
+      ifelse(
+        leap_year(target_years),
+        paste0(target_years, "-02-29"),
+        paste0(target_years, "-02-28")
+      )
+    )
+
+  } else {
+
+    age_cut_dates <- as.Date(
+      paste0(
+        target_years,
+        "-",
+        format(dob, "%m-%d")
+      )
+    )
+  }
+
+  # Keep only age boundaries inside this player's follow-up
+  age_cut_dates <- age_cut_dates[
+    age_cut_dates > start_date &
+      age_cut_dates < end_date
+  ]
+
+  # Keep only calendar boundaries inside follow-up
+  calendar_cut_dates <- calendar_breaks[
+    calendar_breaks > start_date &
+      calendar_breaks < end_date
+  ]
+
+  # Combine start, internal boundaries, and end
+  sort(
+    unique(
+      c(
+        start_date,
+        age_cut_dates,
+        calendar_cut_dates,
+        end_date
+      )
+    )
+  )
+}
+
+
+# Create split intervals
+
+split_fu <- full_fu %>%
+  mutate(player_row = row_number()) %>%
+  rowwise() %>%
+  mutate(
+    split_points = list(
+      make_split_points(
+        DOB,
+        smr_start,
+        analysis_end
+      )
+    ),
+
+    interval_start = list(
+      head(split_points, -1)
+    ),
+
+    interval_end = list(
+      tail(split_points, -1)
+    )
+  ) %>%
+  ungroup() %>%
+  select(-split_points) %>%
+  unnest(c(interval_start, interval_end)) %>%
+  mutate(
+    interval_days =
+      as.numeric(interval_end - interval_start)
+  )
+```
+
+# assign every interval to an age group and calendar period 
+```{r}
+# Assign each split interval to its attained-age group
+# and calendar period
+
+split_fu <- split_fu %>%
+  mutate(
+    # Birthday in the year of interval start
+    birthday_this_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_start)),
+
+        paste0(year(interval_start), "-02-28"),
+
+        paste0(
+          year(interval_start), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    # Attained age at interval start
+    age_at_start =
+      year(interval_start) - year(DOB) -
+      if_else(
+        interval_start < birthday_this_year,
+        1L,
+        0L
+      ),
+
+    # Assign age stratum
+    agecat = cut(
+      age_at_start,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    # Assign calendar stratum
+    calendar = cut(
+      interval_start,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat =
+      as.numeric(as.character(agecat)),
+
+    calendar =
+      as.numeric(as.character(calendar))
+  )
+```
+
+# verify no interval crosses an age or calendar stratum 
+```{r}
+# Verify that each interval stays entirely within
+# one age group and one calendar period
+
+split_fu <- split_fu %>%
+  mutate(
+    # Last actual day contained in the interval
+    interval_last_day = interval_end - 1,
+
+    # Birthday in year of interval last day
+    birthday_last_day_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_last_day)),
+
+        paste0(year(interval_last_day), "-02-28"),
+
+        paste0(
+          year(interval_last_day), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    age_at_last_day =
+      year(interval_last_day) - year(DOB) -
+      if_else(
+        interval_last_day < birthday_last_day_year,
+        1L,
+        0L
+      ),
+
+    agecat_last_day = cut(
+      age_at_last_day,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    calendar_last_day = cut(
+      interval_last_day,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat_last_day =
+      as.numeric(as.character(agecat_last_day)),
+
+    calendar_last_day =
+      as.numeric(as.character(calendar_last_day))
+  )
+```
+
+# aggregate the cohort person-time by age x calendar stratum 
+```{r}
+
+soccer_strata <- split_fu %>%
+  mutate(
+    interval_py = interval_days / 365
+  ) %>%
+  group_by(agecat, calendar) %>%
+  summarise(
+    cohort_person_years = sum(interval_py),
+    n_intervals = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(agecat, calendar)
+```
+
+# join cohort person-time to the complete italian reference 
+```{r}
+# Check that every cohort stratum exists in the Italian reference data
+
+soccer_strata %>%
+  anti_join(
+    italy_ref %>%
+      select(agecat, calendar) %>%
+      distinct(),
+    by = c("agecat", "calendar")
+  )
+
+# Join soccer-player person-time to Italian reference data
+
+smr_data <- italy_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    # Reference strata with no soccer-player time contribute 0 cohort PY
+    cohort_person_years =
+      coalesce(cohort_person_years, 0)
+  ) %>%
+  arrange(agecat, calendar)
+```
+
+# calculate the italian mortality rates and expected deaths 
+```{r}
+# Calculate stratum-specific Italian mortality rates
+# and expected deaths among soccer players
+
+smr_data <- smr_data %>%
+  mutate(
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+```
+
+# dervie the observed deaths from the soccer cohort 
+```{r}
+# Derive observed deaths during SMR-eligible follow-up
+
+full_fu <- full_fu %>%
+  mutate(
+    smr_death = if_else(
+      vitalstatus == 1 &
+        !is.na(DOD) &
+        DOD == analysis_end &
+        DOD >= smr_start,
+      1L,
+      0L
+    )
+  )
+
+
+```
+
+
+
+#####################################
+
+# SMR CALCULATIONS
+
+#####################################
+
+
+--------------------------------------------
+
+# 1. all COD, players with full follow up 
+
+--------------------------------------------
+
+```{r}
+# Calculate all-cause SMR
+
+observed_deaths <- sum(full_fu$smr_death)
+
+expected_deaths <- sum(smr_data$expected_deaths)
+
+smr <- observed_deaths / expected_deaths
+
+# Exact Poisson 95% CI and p-value
+poisson_result <- poisson.test(
+  observed_deaths,
+  T = expected_deaths,
+  r = 1
+)
+
+all_cause_smr_results <- tibble(
+  n_players = nrow(full_fu),
+  observed_deaths = observed_deaths,
+  person_years = sum(smr_data$cohort_person_years),
+  expected_deaths = expected_deaths,
+  SMR = smr,
+  lower_95_CI = poisson_result$conf.int[1],
+  upper_95_CI = poisson_result$conf.int[2],
+  p_value = poisson_result$p.value
+)
+
+all_cause_smr_results
+```
+
+
+--------------------------------------------
+
+# 2. all COD, all players 
+
+--------------------------------------------
+```{r}
+# Includes vitalstatus 0, 1, and 2
+# Partial-follow-up players contribute person-time through LastFU
+
+all_players <- retro_update6 %>%
+  mutate(
+    analysis_end = pmin(
+      coalesce(DOD, admin_end),
+      LastFU,
+      admin_end,
+      na.rm = TRUE
+    )
+  )
+
+# QC
+all_players %>%
+  summarise(
+    n_players = n(),
+    n_alive = sum(vitalstatus == 0),
+    n_deaths = sum(vitalstatus == 1),
+    n_partial_followup = sum(vitalstatus == 2),
+
+    missing_DOB = sum(is.na(DOB)),
+    missing_LastFU = sum(is.na(LastFU)),
+    missing_analysis_end = sum(is.na(analysis_end)),
+
+    missing_DOD_among_deaths =
+      sum(vitalstatus == 1 & is.na(DOD)),
+
+    deaths_end_not_DOD =
+      sum(
+        vitalstatus == 1 &
+          analysis_end != DOD,
+        na.rm = TRUE
+      ),
+
+    analysis_end_after_2023 =
+      sum(
+        analysis_end > admin_end,
+        na.rm = TRUE
+      ),
+
+    analysis_end_before_DOB =
+      sum(
+        analysis_end < DOB,
+        na.rm = TRUE
+      )
+  )
+```
+
+
+# define SMR-eligible follow up for all 5,388 players
+# one player's follow up ended before 1975 so he is NOT SMR eligible
+```{r}
+# Define SMR-eligible follow-up for all players
+
+all_players <- all_players %>%
+  mutate(
+    # 15th birthday, with Feb 29 handled explicitly
+    fifteenth_birthday = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(DOB) + 15),
+
+        paste0(year(DOB) + 15, "-02-28"),
+
+        paste0(
+          year(DOB) + 15, "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    # Eligible follow-up begins at the later of
+    # age 15 or January 1, 1975
+    smr_start = pmax(
+      fifteenth_birthday,
+      ref_start,
+      na.rm = TRUE
+    ),
+
+    smr_followup_days =
+      as.numeric(analysis_end - smr_start),
+
+    smr_followup_py =
+      smr_followup_days / 365
+  )
+```
+
+# create the SMR-contributing all-player dataset (n = 5387)
+```{r}
+# Restrict splitting to players with positive SMR-eligible follow-up
+# Players whose follow-up ended before SMR eligibility contribute 0 person-time
+
+all_players_smr <- all_players %>%
+  filter(smr_followup_days > 0)
+```
+
+# split the all-player SMR person-time 
+```{r}
+split_all <- all_players_smr %>%
+  mutate(player_row = row_number()) %>%
+  rowwise() %>%
+  mutate(
+    split_points = list(
+      make_split_points(
+        DOB,
+        smr_start,
+        analysis_end
+      )
+    ),
+
+    interval_start = list(
+      head(split_points, -1)
+    ),
+
+    interval_end = list(
+      tail(split_points, -1)
+    )
+  ) %>%
+  ungroup() %>%
+  select(-split_points) %>%
+  unnest(c(interval_start, interval_end)) %>%
+  mutate(
+    interval_days =
+      as.numeric(interval_end - interval_start)
+  )
+```
+
+# assign the all-player intervals to age and calendar strata 
+```{r}
+# Assign all-player intervals to attained-age group
+# and calendar period
+
+split_all <- split_all %>%
+  mutate(
+    birthday_this_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_start)),
+
+        paste0(year(interval_start), "-02-28"),
+
+        paste0(
+          year(interval_start), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    age_at_start =
+      year(interval_start) - year(DOB) -
+      if_else(
+        interval_start < birthday_this_year,
+        1L,
+        0L
+      ),
+
+    agecat = cut(
+      age_at_start,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    calendar = cut(
+      interval_start,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat =
+      as.numeric(as.character(agecat)),
+
+    calendar =
+      as.numeric(as.character(calendar))
+  )
+```
+
+# verify no all-player interval crosses an age or calendar boundary 
+```{r}
+# Verify each all-player interval stays entirely within
+# one age group and one calendar period
+
+split_all <- split_all %>%
+  mutate(
+    interval_last_day = interval_end - 1,
+
+    birthday_last_day_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_last_day)),
+
+        paste0(year(interval_last_day), "-02-28"),
+
+        paste0(
+          year(interval_last_day), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    age_at_last_day =
+      year(interval_last_day) - year(DOB) -
+      if_else(
+        interval_last_day < birthday_last_day_year,
+        1L,
+        0L
+      ),
+
+    agecat_last_day = cut(
+      age_at_last_day,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    calendar_last_day = cut(
+      interval_last_day,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat_last_day =
+      as.numeric(as.character(agecat_last_day)),
+
+    calendar_last_day =
+      as.numeric(as.character(calendar_last_day))
+  )
+```
+
+# aggregate all-player person time 
+```{r}
+# Aggregate all-player person-time by age and calendar stratum
+
+all_soccer_strata <- split_all %>%
+  mutate(
+    interval_py = interval_days / 365
+  ) %>%
+  group_by(agecat, calendar) %>%
+  summarise(
+    cohort_person_years = sum(interval_py),
+    n_intervals = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(agecat, calendar)
+```
+
+# join all-player person-time to the italian reference 
+```{r}
+# Check that every all-player cohort stratum exists in the Italian reference data
+
+all_soccer_strata %>%
+  anti_join(
+    italy_ref %>%
+      select(agecat, calendar) %>%
+      distinct(),
+    by = c("agecat", "calendar")
+  )
+
+all_smr_data <- italy_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0)
+  ) %>%
+  arrange(agecat, calendar)
+```
+
+# calculate expected deaths for the all-player cohort 
+```{r}
+# Calculate Italian mortality rates and expected deaths
+# for the all-player cohort
+
+all_smr_data <- all_smr_data %>%
+  mutate(
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+```
+
+# dervie the observed deaths for the all-player SMR 
+```{r}
+# Derive observed deaths during SMR-eligible follow-up
+# for the all-player cohort
+
+all_players <- all_players %>%
+  mutate(
+    smr_death = if_else(
+      vitalstatus == 1 &
+        !is.na(DOD) &
+        DOD == analysis_end &
+        DOD >= smr_start,
+      1L,
+      0L
+    )
+  )
+
+all_players %>%
+  summarise(
+    total_deaths =
+      sum(vitalstatus == 1),
+
+    deaths_before_smr_start =
+      sum(
+        vitalstatus == 1 &
+          DOD < smr_start,
+        na.rm = TRUE
+      ),
+
+    observed_smr_deaths =
+      sum(smr_death),
+
+    deaths_not_counted_in_smr =
+      sum(vitalstatus == 1) - sum(smr_death)
+  )
+```
+
+# all COD all player SMR
+```{r}
+# Calculate all-player all-cause SMR
+
+observed_all <- sum(all_players$smr_death)
+
+expected_all <- sum(all_smr_data$expected_deaths)
+
+smr_all <- observed_all / expected_all
+
+# Exact Poisson 95% CI and p-value
+poisson_all <- poisson.test(
+  observed_all,
+  T = expected_all,
+  r = 1
+)
+
+all_player_smr_results <- tibble(
+  n_players = nrow(all_players),
+  n_players_contributing_person_time = nrow(all_players_smr),
+  observed_deaths = observed_all,
+  person_years = sum(all_smr_data$cohort_person_years),
+  expected_deaths = expected_all,
+  SMR = smr_all,
+  lower_95_CI = poisson_all$conf.int[1],
+  upper_95_CI = poisson_all$conf.int[2],
+  p_value = poisson_all$p.value
+)
+
+all_player_smr_results
+```
+
+
+
+#####################################
+
+# CAUSE-SPECIFIC SM CALCULATIONS
+
+#####################################
+
+
+---------------------------------------
+
+# COVID 19, only players full follow up 
+
+---------------------------------------
+
+```{r}
+covid_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_CovidRef_9.18.2024_IHME_2020.2021.xlsx"
+)
+
+covid_ref <- read_excel(
+  covid_file,
+  sheet = "COVID Ref"
+)
+
+covid_cohort_old <- read_excel(
+  covid_file,
+  sheet = "COVID Cohort"
+)
+```
+
+# calculate the eligible 2020-2021 follow-up window 
+```{r}
+# Define COVID-specific follow-up window
+# Italian COVID reference data are available only for 2020 and 2021
+
+covid_ref_start <- as.Date("2020-01-01")
+covid_ref_end   <- as.Date("2022-01-01")
+
+covid_fu <- full_fu %>%
+  mutate(
+    covid_start = pmax(
+      smr_start,
+      covid_ref_start,
+      na.rm = TRUE
+    ),
+
+    covid_end = pmin(
+      analysis_end,
+      covid_ref_end,
+      na.rm = TRUE
+    ),
+
+    covid_followup_days =
+      as.numeric(covid_end - covid_start),
+
+    covid_followup_py =
+      covid_followup_days / 365
+  ) %>%
+  filter(covid_followup_days > 0)
+
+```
+
+# split the follow up at age group and year boundaries 
+```{r}
+
+covid_calendar_breaks <- as.Date(c(
+  "2020-01-01",
+  "2021-01-01",
+  "2022-01-01"
+))
+
+make_covid_split_points <- function(dob, start_date, end_date) {
+
+  # Birthdays where a new 5-year age category begins
+  cut_ages <- seq(20, 90, by = 5)
+  target_years <- year(dob) + cut_ages
+
+  # Construct age-boundary dates
+  if (format(dob, "%m-%d") == "02-29") {
+
+    age_cut_dates <- as.Date(
+      ifelse(
+        leap_year(target_years),
+        paste0(target_years, "-02-29"),
+        paste0(target_years, "-02-28")
+      )
+    )
+
+  } else {
+
+    age_cut_dates <- as.Date(
+      paste0(
+        target_years,
+        "-",
+        format(dob, "%m-%d")
+      )
+    )
+  }
+
+  age_cut_dates <- age_cut_dates[
+    age_cut_dates > start_date &
+      age_cut_dates < end_date
+  ]
+
+  calendar_cut_dates <- covid_calendar_breaks[
+    covid_calendar_breaks > start_date &
+      covid_calendar_breaks < end_date
+  ]
+
+  sort(
+    unique(
+      c(
+        start_date,
+        age_cut_dates,
+        calendar_cut_dates,
+        end_date
+      )
+    )
+  )
+}
+
+
+covid_split <- covid_fu %>%
+  mutate(player_row = row_number()) %>%
+  rowwise() %>%
+  mutate(
+    split_points = list(
+      make_covid_split_points(
+        DOB,
+        covid_start,
+        covid_end
+      )
+    ),
+
+    interval_start = list(
+      head(split_points, -1)
+    ),
+
+    interval_end = list(
+      tail(split_points, -1)
+    )
+  ) %>%
+  ungroup() %>%
+  select(-split_points) %>%
+  unnest(c(interval_start, interval_end)) %>%
+  mutate(
+    interval_days =
+      as.numeric(interval_end - interval_start)
+  )
+```
+
+# assign each interval to age group and calendar year 
+```{r}
+
+covid_split <- covid_split %>%
+  mutate(
+    birthday_this_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_start)),
+
+        paste0(year(interval_start), "-02-28"),
+
+        paste0(
+          year(interval_start), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    age_at_start =
+      year(interval_start) - year(DOB) -
+      if_else(
+        interval_start < birthday_this_year,
+        1L,
+        0L
+      ),
+
+    agecat = cut(
+      age_at_start,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    agecat =
+      as.numeric(as.character(agecat)),
+
+    calendar =
+      year(interval_start)
+  )
+```
+
+# aggregate person time by age x year
+```{r}
+covid_strata <- covid_split %>%
+  mutate(
+    interval_py = interval_days / 365
+  ) %>%
+  group_by(agecat, calendar) %>%
+  summarise(
+    cohort_person_years = sum(interval_py),
+    n_intervals = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+covid_strata %>%
+  summarise(
+    n_strata_with_time = n(),
+    total_person_years = sum(cohort_person_years),
+    min_person_years = min(cohort_person_years),
+    max_person_years = max(cohort_person_years)
+  )
+
+anti_join(
+  covid_strata,
+  covid_ref %>% select(agecat, calendar),
+  by = c("agecat", "calendar")
+)
+```
+
+# apply the italian covid mortality rates 
+```{r}
+covid_smr_data <- covid_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    covid_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+covid_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  )
+```
+
+# calculate final covid SMR 
+```{r}
+# Derive observed COVID deaths from the historical cause-specific cohort sheet
+
+observed_covid <- sum(
+  covid_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_covid <- sum(
+  covid_smr_data$expected_deaths
+)
+
+poisson_covid <- poisson.test(
+  observed_covid,
+  T = expected_covid,
+  r = 1
+)
+
+covid_results <- tibble(
+  cause = "COVID-19",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_covid,
+  person_years = sum(covid_smr_data$cohort_person_years),
+  expected_deaths = expected_covid,
+  SMR = observed_covid / expected_covid,
+  lower_95_CI = poisson_covid$conf.int[1],
+  upper_95_CI = poisson_covid$conf.int[2],
+  p_value = poisson_covid$p.value
+)
+
+covid_results %>%
+  print(width = Inf)
+```
+
+
+
+------------------------------------
+
+# cardio SMR, full follow up players
+
+------------------------------------
+
+```{r}
+
+cardio_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_CardioRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(cardio_file)
+
+cardio_ref <- read_excel(
+  cardio_file,
+  sheet = "Cardio Ref"
+)
+
+cardio_cohort_old <- read_excel(
+  cardio_file,
+  sheet = "Cardio Cohort"
+)
+```
+
+# clean and QC the reference 
+```{r}
+cardio_ref <- cardio_ref %>%
+  select(
+    agecat,
+    calendar,
+    perioddeaths,
+    periodpys
+  )
+
+cardio_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian cardiovascular rates to our rebuilt person time 
+```{r}
+cardio_smr_data <- cardio_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+cardio_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate final cardio SMR 
+```{r}
+observed_cardio <- sum(
+  cardio_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_cardio <- sum(
+  cardio_smr_data$expected_deaths
+)
+
+poisson_cardio <- poisson.test(
+  observed_cardio,
+  T = expected_cardio,
+  r = 1
+)
+
+cardio_results <- tibble(
+  cause = "Cardiovascular disease",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_cardio,
+  person_years = sum(cardio_smr_data$cohort_person_years),
+  expected_deaths = expected_cardio,
+  SMR = observed_cardio / expected_cardio,
+  lower_95_CI = poisson_cardio$conf.int[1],
+  upper_95_CI = poisson_cardio$conf.int[2],
+  p_value = poisson_cardio$p.value
+)
+
+cardio_results %>%
+  print(width = Inf)
+```
+
+
+--------------------------------
+
+# confirmed cancer cases SMR, full follow up players
+
+--------------------------------
+
+```{r}
+cancer_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_CancerRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(cancer_file)
+
+cancer_ref <- read_excel(
+  cancer_file,
+  sheet = "Cancer Ref"
+)
+
+cancer_cohort_old <- read_excel(
+  cancer_file,
+  sheet = "Cancer Cohort"
+)
+```
+
+# clean and QC the reference 
+```{r}
+cancer_ref <- cancer_ref %>%
+  select(
+    agecat,
+    calendar,
+    perioddeaths,
+    periodpys
+  )
+
+cancer_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian cancer rates to our rebuilt person-time
+```{r}
+cancer_smr_data <- cancer_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+cancer_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate the final confirmed cancer SMR 
+```{r}
+observed_cancer <- sum(
+  cancer_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_cancer <- sum(
+  cancer_smr_data$expected_deaths
+)
+
+poisson_cancer <- poisson.test(
+  observed_cancer,
+  T = expected_cancer,
+  r = 1
+)
+
+cancer_results <- tibble(
+  cause = "Confirmed cancer",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_cancer,
+  person_years = sum(cancer_smr_data$cohort_person_years),
+  expected_deaths = expected_cancer,
+  SMR = observed_cancer / expected_cancer,
+  lower_95_CI = poisson_cancer$conf.int[1],
+  upper_95_CI = poisson_cancer$conf.int[2],
+  p_value = poisson_cancer$p.value
+)
+
+cancer_results %>%
+  print(width = Inf)
+```
+
+
+----------------------------
+
+# car accidents SMR, full follow up players 
+
+---------------------------
+
+```{r}
+caracc_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_CarAccRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(caracc_file)
+
+caracc_ref <- read_excel(
+  caracc_file,
+  sheet = "CarAcc Ref"
+)
+
+caracc_cohort_old <- read_excel(
+  caracc_file,
+  sheet = "CarAcc Cohort"
+)
+```
+
+# clean and QC the reference
+```{r}
+caracc_ref <- caracc_ref %>%
+  select(
+    agecat,
+    calendar,
+    perioddeaths,
+    periodpys
+  )
+
+caracc_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian car accident rates to our rebuilt person time 
+```{r}
+caracc_smr_data <- caracc_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+caracc_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate final car accident SMR 
+```{r}
+observed_caracc <- sum(
+  caracc_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_caracc <- sum(
+  caracc_smr_data$expected_deaths
+)
+
+poisson_caracc <- poisson.test(
+  observed_caracc,
+  T = expected_caracc,
+  r = 1
+)
+
+caracc_results <- tibble(
+  cause = "Car accidents",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_caracc,
+  person_years = sum(caracc_smr_data$cohort_person_years),
+  expected_deaths = expected_caracc,
+  SMR = observed_caracc / expected_caracc,
+  lower_95_CI = poisson_caracc$conf.int[1],
+  upper_95_CI = poisson_caracc$conf.int[2],
+  p_value = poisson_caracc$p.value
+)
+
+caracc_results %>%
+  print(width = Inf)
+```
+
+
+----------------------------
+
+# suicide, violent deaths SMR, full follow up players 
+
+---------------------------
+
+```{r}
+suicide_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_SuicideRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(suicide_file)
+
+suicide_ref <- read_excel(
+  suicide_file,
+  sheet = "Suicide Ref"
+)
+
+suicide_cohort_old <- read_excel(
+  suicide_file,
+  sheet = "Suicide Cohort"
+)
+```
+
+# clean and QC the reference 
+```{r}
+suicide_ref <- suicide_ref %>%
+  select(
+    agecat,
+    calendar,
+    perioddeaths,
+    periodpys
+  )
+
+suicide_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian suicide rates to our rebuilt person time 
+```{r}
+suicide_smr_data <- suicide_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+suicide_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate the final suicide/violent deaths SMR
+```{r}
+observed_suicide <- sum(
+  suicide_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_suicide <- sum(
+  suicide_smr_data$expected_deaths
+)
+
+poisson_suicide <- poisson.test(
+  observed_suicide,
+  T = expected_suicide,
+  r = 1
+)
+
+suicide_results <- tibble(
+  cause = "Suicide",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_suicide,
+  person_years = sum(suicide_smr_data$cohort_person_years),
+  expected_deaths = expected_suicide,
+  SMR = observed_suicide / expected_suicide,
+  lower_95_CI = poisson_suicide$conf.int[1],
+  upper_95_CI = poisson_suicide$conf.int[2],
+  p_value = poisson_suicide$p.value
+)
+
+suicide_results %>%
+  print(width = Inf)
+```
+
+
+----------------------------------
+
+# neurodegenerative diseases including als, full follow up players 
+
+---------------------------------
+
+```{r}
+neuro_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_NeuroRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(neuro_file)
+
+neuro_ref <- read_excel(
+  neuro_file,
+  sheet = "Neuro Ref")
+  
+neuro_cohort_old = read_excel(
+  neuro_file,
+  sheet = "Neuro Cohort"
+)
+```
+
+# QC the reference 
+```{r}
+neuro_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian neurodegenerative rates to our rebuilt person time 
+```{r}
+neuro_smr_data <- neuro_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+neuro_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate the final neuro SMR 
+```{r}
+observed_neuro <- sum(
+  neuro_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_neuro <- sum(
+  neuro_smr_data$expected_deaths
+)
+
+poisson_neuro <- poisson.test(
+  observed_neuro,
+  T = expected_neuro,
+  r = 1
+)
+
+neuro_results <- tibble(
+  cause = "Neurodegenerative disease",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_neuro,
+  person_years = sum(neuro_smr_data$cohort_person_years),
+  expected_deaths = expected_neuro,
+  SMR = observed_neuro / expected_neuro,
+  lower_95_CI = poisson_neuro$conf.int[1],
+  upper_95_CI = poisson_neuro$conf.int[2],
+  p_value = poisson_neuro$p.value
+)
+
+neuro_results %>%
+  print(width = Inf)
+```
+
+
+-----------------------------------------
+
+# cancer including unconfirmed cases, full follow up players 
+
+----------------------------------------
+
+```{r}
+cancer_long_file <- paste0(
+  "sas_datafiles/",
+  "ItalySoccer_CancerwLongDisRef_9.18.2024_IHME_1975.2023.xlsx"
+)
+
+excel_sheets(cancer_long_file)
+
+cancer_long_ref <- read_excel(
+  cancer_long_file,
+  sheet = "Cancer Long Ref"
+)
+
+cancer_long_cohort_old <- read_excel(
+  cancer_long_file,
+  sheet = "Cancer Long Cohort"
+)
+
+cancer_long_cohort_old <- cancer_long_cohort_old %>%
+  filter(
+    !is.na(agecat),
+    !is.na(calendar)
+  )
+```
+
+# QC the reference 
+```{r}
+cancer_long_ref %>%
+  summarise(
+    n_rows = n(),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_periods = n_distinct(calendar),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    missing_deaths = sum(is.na(perioddeaths)),
+    missing_person_years = sum(is.na(periodpys)),
+    zero_or_negative_person_years =
+      sum(periodpys <= 0, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# apply the italian cancer rates to our rebuilt person time 
+```{r}
+cancer_long_smr_data <- cancer_long_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  ) %>%
+  arrange(agecat, calendar)
+
+# QC
+cancer_long_smr_data %>%
+  summarise(
+    n_reference_strata = n(),
+    n_strata_with_cohort_time =
+      sum(cohort_person_years > 0),
+    missing_ref_deaths =
+      sum(is.na(ref_deaths)),
+    missing_ref_person_years =
+      sum(is.na(ref_person_years)),
+    total_cohort_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths)
+  ) %>%
+  print(width = Inf)
+```
+
+# calculate final cancer w unconfirmed cases SMR 
+```{r}
+observed_cancer_long <- sum(
+  cancer_long_cohort_old$perioddeaths,
+  na.rm = TRUE
+)
+
+expected_cancer_long <- sum(
+  cancer_long_smr_data$expected_deaths
+)
+
+poisson_cancer_long <- poisson.test(
+  observed_cancer_long,
+  T = expected_cancer_long,
+  r = 1
+)
+
+cancer_long_results <- tibble(
+  cause = "Cancer including long disease",
+  n_players = nrow(full_fu),
+  observed_deaths = observed_cancer_long,
+  person_years = sum(cancer_long_smr_data$cohort_person_years),
+  expected_deaths = expected_cancer_long,
+  SMR = observed_cancer_long / expected_cancer_long,
+  lower_95_CI = poisson_cancer_long$conf.int[1],
+  upper_95_CI = poisson_cancer_long$conf.int[2],
+  p_value = poisson_cancer_long$p.value
+)
+
+cancer_long_results %>%
+  print(width = Inf)
+```
+
+
+######################################
+
+# COMBINE ALL MAIN SMR RESULTS 
+
+#####################################
+
+```{r}
+smr_results_combined <- bind_rows(
+
+  all_cause_smr_results %>%
+    mutate(cause = "All-cause") %>%
+    select(
+      cause,
+      n_players,
+      observed_deaths,
+      person_years,
+      expected_deaths,
+      SMR,
+      lower_95_CI,
+      upper_95_CI,
+      p_value
+    ),
+
+  covid_results,
+
+  cardio_results,
+
+  cancer_results,
+
+  caracc_results,
+
+  suicide_results,
+
+  neuro_results,
+
+  cancer_long_results %>%
+    mutate(
+      cause = "Cancer including unconfirmed cases"
+    )
+) %>%
+  mutate(
+    cause = factor(
+      cause,
+      levels = c(
+        "All-cause",
+        "COVID-19",
+        "Cardiovascular disease",
+        "Confirmed cancer",
+        "Cancer including unconfirmed cases",
+        "Car accidents",
+        "Suicide",
+        "Neurodegenerative disease"
+      )
+    )
+  ) %>%
+  arrange(cause)
+
+# Numeric results table
+smr_results_combined %>%
+  print(width = Inf)
+
+
+smr_table <- smr_results_combined %>%
+  mutate(
+    `Person-years` = format(
+      round(person_years),
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+
+    Expected = sprintf("%.1f", expected_deaths),
+
+    `SMR (95% CI)` = sprintf(
+      "%.2f (%.2f–%.2f)",
+      SMR,
+      lower_95_CI,
+      upper_95_CI
+    ),
+
+    `P-value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  ) %>%
+  transmute(
+    Cause = as.character(cause),
+    N = n_players,
+    Observed = observed_deaths,
+    `Person-years`,
+    Expected,
+    `SMR (95% CI)`,
+    `P-value`
+  )
+
+smr_table
+
+
+# tibble 
+smr_summary <- bind_rows(
+  all_cause_smr_results %>%
+    mutate(cause = "All-cause"),
+
+  covid_results,
+
+  cardio_results,
+
+  cancer_results,
+
+  cancer_long_results %>%
+    mutate(cause = "Cancer including unconfirmed cases"),
+
+  caracc_results,
+
+  suicide_results,
+
+  neuro_results
+) %>%
+  transmute(
+    Cause = cause,
+    N = n_players,
+    `Observed deaths` = observed_deaths,
+    `Person-years` = round(person_years, 1),
+    `Expected deaths` = round(expected_deaths, 1),
+    SMR = round(SMR, 3),
+    `95% CI` = paste0(
+      round(lower_95_CI, 3),
+      "–",
+      round(upper_95_CI, 3)
+    ),
+    `P-value` = case_when(
+      p_value < 0.001 ~ "<0.001",
+      TRUE ~ sprintf("%.3f", p_value)
+    )
+  )
+
+smr_summary %>%
+View(smr_summary)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+####################################
+
+# sensitivity analyses 
+# 1. follow up calculated from the start of professional career 
+# 2. those with partial follow up included in the analysis
+
+####################################
+
+# define professional career start as june 15 of the esordio year 
+```{r}
+career_fu <- full_fu %>%
+  mutate(
+    career_start = as.Date(
+      paste0(esordio, "-06-15")
+    )
+  )
+
+career_fu %>%
+  summarise(
+    n_players = n(),
+    missing_career_start = sum(is.na(career_start)),
+    career_start_after_followup =
+      sum(career_start >= analysis_end, na.rm = TRUE),
+    min_career_start = min(career_start, na.rm = TRUE),
+    max_career_start = max(career_start, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+
+career_fu <- career_fu %>%
+  mutate(
+    career_smr_start = if_else(
+      is.na(career_start),
+      as.Date(NA),
+      pmax(career_start, smr_start)
+    ),
+
+    career_smr_followup_days =
+      as.numeric(analysis_end - career_smr_start),
+
+    career_smr_followup_py =
+      career_smr_followup_days / 365
+  )
+
+career_fu %>%
+  summarise(
+    n_players = n(),
+    missing_career_smr_start =
+      sum(is.na(career_smr_start)),
+    nonpositive_followup =
+      sum(career_smr_followup_days <= 0, na.rm = TRUE),
+    total_career_smr_person_years =
+      sum(career_smr_followup_py, na.rm = TRUE),
+    n_career_start_controls =
+      sum(career_start > smr_start, na.rm = TRUE),
+    n_age15_or_1975_controls =
+      sum(career_start <= smr_start, na.rm = TRUE)
+  ) %>%
+  print(width = Inf)
+```
+
+# split the new follow up exactly 
+```{r}
+career_split <- career_fu %>%
+  filter(!is.na(career_smr_start)) %>%
+  rowwise() %>%
+  mutate(
+    split_points = list(
+      make_split_points(
+        DOB,
+        career_smr_start,
+        analysis_end
+      )
+    ),
+
+    interval_start = list(
+      head(split_points, -1)
+    ),
+
+    interval_end = list(
+      tail(split_points, -1)
+    )
+  ) %>%
+  ungroup() %>%
+  select(-split_points) %>%
+  unnest(c(interval_start, interval_end)) %>%
+  mutate(
+    interval_days =
+      as.numeric(interval_end - interval_start)
+  )
+
+# QC
+career_split %>%
+  summarise(
+    n_intervals = n(),
+    missing_interval_start = sum(is.na(interval_start)),
+    missing_interval_end = sum(is.na(interval_end)),
+    nonpositive_intervals =
+      sum(interval_days <= 0, na.rm = TRUE),
+    total_split_person_years =
+      sum(interval_days / 365)
+  ) %>%
+  print(width = Inf)
+```
+
+# assign age and calendar strata 
+```{r}
+career_split <- career_split %>%
+  mutate(
+    # Birthday in the year of interval start
+    birthday_this_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_start)),
+
+        paste0(year(interval_start), "-02-28"),
+
+        paste0(
+          year(interval_start), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    # Attained age at interval start
+    age_at_start =
+      year(interval_start) - year(DOB) -
+      if_else(
+        interval_start < birthday_this_year,
+        1L,
+        0L
+      ),
+
+    # Age stratum
+    agecat = cut(
+      age_at_start,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    # Calendar stratum
+    calendar = cut(
+      interval_start,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat = as.numeric(as.character(agecat)),
+    calendar = as.numeric(as.character(calendar))
+  )
+
+career_split %>%
+  summarise(
+    n_intervals = n(),
+    missing_agecat = sum(is.na(agecat)),
+    missing_calendar = sum(is.na(calendar)),
+    min_age = min(age_at_start, na.rm = TRUE),
+    max_age = max(age_at_start, na.rm = TRUE),
+    n_age_groups = n_distinct(agecat),
+    n_calendar_groups = n_distinct(calendar)
+  ) %>%
+  print(width = Inf)
+```
+
+# verify no interval crosses a stratum 
+```{r}
+career_split <- career_split %>%
+  mutate(
+    interval_last_day = interval_end - 1,
+
+    birthday_last_day_year = as.Date(
+      if_else(
+        format(DOB, "%m-%d") == "02-29" &
+          !leap_year(year(interval_last_day)),
+
+        paste0(year(interval_last_day), "-02-28"),
+
+        paste0(
+          year(interval_last_day), "-",
+          format(DOB, "%m-%d")
+        )
+      )
+    ),
+
+    age_at_last_day =
+      year(interval_last_day) - year(DOB) -
+      if_else(
+        interval_last_day < birthday_last_day_year,
+        1L,
+        0L
+      ),
+
+    agecat_last_day = cut(
+      age_at_last_day,
+      breaks = age_breaks,
+      labels = age_labels,
+      right = FALSE
+    ),
+
+    calendar_last_day = cut(
+      interval_last_day,
+      breaks = calendar_breaks,
+      labels = calendar_labels,
+      right = FALSE
+    ),
+
+    agecat_last_day =
+      as.numeric(as.character(agecat_last_day)),
+
+    calendar_last_day =
+      as.numeric(as.character(calendar_last_day))
+  )
+
+career_split %>%
+  summarise(
+    intervals_crossing_age_group =
+      sum(agecat != agecat_last_day, na.rm = TRUE),
+
+    intervals_crossing_calendar_group =
+      sum(calendar != calendar_last_day, na.rm = TRUE),
+
+    missing_agecat_last_day =
+      sum(is.na(agecat_last_day)),
+
+    missing_calendar_last_day =
+      sum(is.na(calendar_last_day))
+  ) %>%
+  print(width = Inf)
+```
+
+# aggregate person time by age x calendar stratum 
+```{r}
+career_soccer_strata <- career_split %>%
+  mutate(
+    interval_py = interval_days / 365
+  ) %>%
+  group_by(agecat, calendar) %>%
+  summarise(
+    cohort_person_years = sum(interval_py),
+    n_intervals = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(agecat, calendar)
+
+career_soccer_strata %>%
+  summarise(
+    n_strata = n(),
+    total_person_years = sum(cohort_person_years)
+  ) %>%
+  print(width = Inf)
+```
+
+# join to italian reference and calculate expected deaths 
+```{r}
+career_smr_data <- italy_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) 
+```
+
+```{r}
+career_fu <- career_fu %>%
+  mutate(
+    career_smr_death = if_else(
+      vitalstatus == 1 &
+        !is.na(DOD) &
+        !is.na(career_smr_start) &
+        DOD == analysis_end &
+        DOD >= career_smr_start,
+      1L,
+      0L
+    )
+  )
+
+sum(career_fu$career_smr_death)
+```
+
+
+# calculate all cause of death SMR 
+```{r}
+observed_career <- sum(career_fu$career_smr_death)
+
+expected_career <- sum(career_smr_data$expected_deaths)
+
+career_smr <- observed_career / expected_career
+
+career_poisson <- poisson.test(
+  observed_career,
+  T = expected_career,
+  r = 1
+)
+
+career_allcause_results <- tibble(
+  cause = "All-cause",
+  n_players = nrow(career_fu) - sum(is.na(career_fu$career_smr_start)),
+  observed_deaths = observed_career,
+  person_years = sum(career_smr_data$cohort_person_years),
+  expected_deaths = expected_career,
+  SMR = career_smr,
+  lower_95_CI = career_poisson$conf.int[1],
+  upper_95_CI = career_poisson$conf.int[2],
+  p_value = career_poisson$p.value
+)
+
+career_allcause_results
+```
+
+# covid esordio sensitivity 
+```{r}
+career_covid_fu <- career_fu %>%
+  filter(!is.na(career_smr_start)) %>%
+  mutate(
+    covid_followup_start = pmax(
+      career_smr_start,
+      as.Date("2020-01-01")
+    ),
+
+    covid_followup_end = pmin(
+      analysis_end,
+      as.Date("2022-01-01")
+    ),
+
+    covid_followup_days =
+      as.numeric(
+        covid_followup_end - covid_followup_start
+      )
+  ) %>%
+  filter(covid_followup_days > 0)
+
+career_covid_fu %>%
+  summarise(
+    n_players_contributing = n(),
+    total_covid_person_years =
+      sum(covid_followup_days / 365),
+    min_start = min(covid_followup_start),
+    max_end = max(covid_followup_end)
+  ) %>%
+  print(width = Inf)
+
+career_covid_fu %>%
+  select(
+    Codice_nostro,
+    career_start = covid_followup_start,
+    career_end = covid_followup_end
+  ) %>%
+  inner_join(
+    covid_fu %>%
+      select(
+        Codice_nostro,
+        primary_start = covid_start,
+        primary_end = covid_end
+      ),
+    by = "Codice_nostro"
+  ) %>%
+  summarise(
+    n_compared = n(),
+    different_start =
+      sum(career_start != primary_start),
+    different_end =
+      sum(career_end != primary_end)
+  ) %>%
+  print(width = Inf)
+```
+
+# cardio esordio sensitivity 
+```{r}
+career_cardio_smr_data <- cardio_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_cardio_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_cardio_expected <- sum(
+  career_cardio_smr_data$expected_deaths
+)
+
+career_cardio_poisson <- poisson.test(
+  observed_cardio,
+  T = career_cardio_expected,
+  r = 1
+)
+
+career_cardio_results <- tibble(
+  cause = "Cardiovascular disease",
+  n_players = 4435,
+  observed_deaths = observed_cardio,
+  person_years = sum(
+    career_cardio_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_cardio_expected,
+  SMR = observed_cardio / career_cardio_expected,
+  lower_95_CI = career_cardio_poisson$conf.int[1],
+  upper_95_CI = career_cardio_poisson$conf.int[2],
+  p_value = career_cardio_poisson$p.value
+)
+
+career_cardio_results %>%
+  print(width = Inf)
+```
+
+
+# cancer confirmed esordio sensitivity 
+```{r}
+career_cancer_smr_data <- cancer_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_cancer_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_cancer_expected <- sum(
+  career_cancer_smr_data$expected_deaths
+)
+
+career_cancer_poisson <- poisson.test(
+  observed_cancer,
+  T = career_cancer_expected,
+  r = 1
+)
+
+career_cancer_results <- tibble(
+  cause = "Confirmed cancer",
+  n_players = 4435,
+  observed_deaths = observed_cancer,
+  person_years = sum(
+    career_cancer_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_cancer_expected,
+  SMR = observed_cancer / career_cancer_expected,
+  lower_95_CI = career_cancer_poisson$conf.int[1],
+  upper_95_CI = career_cancer_poisson$conf.int[2],
+  p_value = career_cancer_poisson$p.value
+)
+
+career_cancer_results %>%
+  print(width = Inf)
+```
+
+# car accident esordio sensitivity 
+```{r}
+career_caracc_smr_data <- caracc_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_caracc_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_caracc_expected <- sum(
+  career_caracc_smr_data$expected_deaths
+)
+
+career_caracc_poisson <- poisson.test(
+  observed_caracc,
+  T = career_caracc_expected,
+  r = 1
+)
+
+career_caracc_results <- tibble(
+  cause = "Car accidents",
+  n_players = 4435,
+  observed_deaths = observed_caracc,
+  person_years = sum(
+    career_caracc_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_caracc_expected,
+  SMR = observed_caracc / career_caracc_expected,
+  lower_95_CI = career_caracc_poisson$conf.int[1],
+  upper_95_CI = career_caracc_poisson$conf.int[2],
+  p_value = career_caracc_poisson$p.value
+)
+
+career_caracc_results %>%
+  print(width = Inf)
+```
+
+
+# suicide esordio sensitivity 
+```{r}
+career_suicide_smr_data <- suicide_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_suicide_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_suicide_expected <- sum(
+  career_suicide_smr_data$expected_deaths
+)
+
+career_suicide_poisson <- poisson.test(
+  observed_suicide,
+  T = career_suicide_expected,
+  r = 1
+)
+
+career_suicide_results <- tibble(
+  cause = "Suicide",
+  n_players = 4435,
+  observed_deaths = observed_suicide,
+  person_years = sum(
+    career_suicide_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_suicide_expected,
+  SMR = observed_suicide / career_suicide_expected,
+  lower_95_CI = career_suicide_poisson$conf.int[1],
+  upper_95_CI = career_suicide_poisson$conf.int[2],
+  p_value = career_suicide_poisson$p.value
+)
+
+career_suicide_results %>%
+  print(width = Inf)
+```
+
+# neuro esordio sensitivity 
+```{r}
+career_neuro_smr_data <- neuro_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_neuro_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_neuro_expected <- sum(
+  career_neuro_smr_data$expected_deaths
+)
+
+career_neuro_poisson <- poisson.test(
+  observed_neuro,
+  T = career_neuro_expected,
+  r = 1
+)
+
+career_neuro_results <- tibble(
+  cause = "Neurodegenerative disease",
+  n_players = 4435,
+  observed_deaths = observed_neuro,
+  person_years = sum(
+    career_neuro_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_neuro_expected,
+  SMR = observed_neuro / career_neuro_expected,
+  lower_95_CI = career_neuro_poisson$conf.int[1],
+  upper_95_CI = career_neuro_poisson$conf.int[2],
+  p_value = career_neuro_poisson$p.value
+)
+
+career_neuro_results %>%
+  print(width = Inf)
+```
+
+
+# cancer unconfirmed cases esordio sensitvity 
+```{r}
+career_cancer_long_smr_data <- cancer_long_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    career_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+career_cancer_long_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+career_cancer_long_expected <- sum(
+  career_cancer_long_smr_data$expected_deaths
+)
+
+career_cancer_long_poisson <- poisson.test(
+  observed_cancer_long,
+  T = career_cancer_long_expected,
+  r = 1
+)
+
+career_cancer_long_results <- tibble(
+  cause = "Cancer including unconfirmed cases",
+  n_players = 4435,
+  observed_deaths = observed_cancer_long,
+  person_years = sum(
+    career_cancer_long_smr_data$cohort_person_years
+  ),
+  expected_deaths = career_cancer_long_expected,
+  SMR = observed_cancer_long / career_cancer_long_expected,
+  lower_95_CI = career_cancer_long_poisson$conf.int[1],
+  upper_95_CI = career_cancer_long_poisson$conf.int[2],
+  p_value = career_cancer_long_poisson$p.value
+)
+
+career_cancer_long_results %>%
+  print(width = Inf)
+```
+
+# covid esordio sensitivity results object 
+```{r}
+career_covid_results <- covid_results %>%
+  mutate(
+    n_players = 4435
+  )
+
+career_covid_results %>%
+  print(width = Inf)
+```
+
+
+
+# combine all esordio sensitivity analyses results into one table 
+```{r}
+esordio_smr_results_combined <- bind_rows(
+  career_allcause_results,
+  career_covid_results,
+  career_cardio_results,
+  career_cancer_results,
+  career_cancer_long_results,
+  career_caracc_results,
+  career_suicide_results,
+  career_neuro_results
+) %>%
+  mutate(
+    cause = factor(
+      cause,
+      levels = c(
+        "All-cause",
+        "COVID-19",
+        "Cardiovascular disease",
+        "Confirmed cancer",
+        "Cancer including unconfirmed cases",
+        "Car accidents",
+        "Suicide",
+        "Neurodegenerative disease"
+      )
+    )
+  ) %>%
+  arrange(cause)
+
+esordio_smr_results_combined %>%
+  print(width = Inf)
+```
+
+
+
+
+# all players sensitivity 
+
+# covid all players sensitivity 
+```{r}
+all_covid_fu <- all_players %>%
+  mutate(
+    covid_start = pmax(
+      smr_start,
+      as.Date("2020-01-01"),
+      na.rm = TRUE
+    ),
+
+    covid_end = pmin(
+      analysis_end,
+      as.Date("2022-01-01"),
+      na.rm = TRUE
+    ),
+
+    covid_followup_days =
+      as.numeric(covid_end - covid_start),
+
+    covid_followup_py =
+      covid_followup_days / 365
+  ) %>%
+  filter(covid_followup_days > 0)
+
+all_covid_fu %>%
+  summarise(
+    n_players_contributing = n(),
+    n_partial_contributing =
+      sum(vitalstatus == 2),
+    total_covid_person_years =
+      sum(covid_followup_py),
+    min_start = min(covid_start),
+    max_end = max(covid_end)
+  ) %>%
+  print(width = Inf)
+
+# same exact cohort -- results dont change
+```
+
+# cardio all players sensitivity 
+```{r}
+all_cardio_smr_data <- cardio_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_cardio_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_cardio_expected <- sum(
+  all_cardio_smr_data$expected_deaths
+)
+
+all_cardio_poisson <- poisson.test(
+  observed_cardio,
+  T = all_cardio_expected,
+  r = 1
+)
+
+all_cardio_results <- tibble(
+  cause = "Cardiovascular disease",
+  n_players = nrow(all_players),
+  observed_deaths = observed_cardio,
+  person_years = sum(
+    all_cardio_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_cardio_expected,
+  SMR = observed_cardio / all_cardio_expected,
+  lower_95_CI = all_cardio_poisson$conf.int[1],
+  upper_95_CI = all_cardio_poisson$conf.int[2],
+  p_value = all_cardio_poisson$p.value
+)
+
+all_cardio_results %>%
+  print(width = Inf)
+```
+
+# confirmed cancer all players sensitivity 
+```{r}
+all_cancer_smr_data <- cancer_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_cancer_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_cancer_expected <- sum(
+  all_cancer_smr_data$expected_deaths
+)
+
+all_cancer_poisson <- poisson.test(
+  observed_cancer,
+  T = all_cancer_expected,
+  r = 1
+)
+
+all_cancer_results <- tibble(
+  cause = "Confirmed cancer",
+  n_players = nrow(all_players),
+  observed_deaths = observed_cancer,
+  person_years = sum(
+    all_cancer_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_cancer_expected,
+  SMR = observed_cancer / all_cancer_expected,
+  lower_95_CI = all_cancer_poisson$conf.int[1],
+  upper_95_CI = all_cancer_poisson$conf.int[2],
+  p_value = all_cancer_poisson$p.value
+)
+
+all_cancer_results %>%
+  print(width = Inf)
+```
+
+# car accidents all players sensitivity 
+```{r}
+all_caracc_smr_data <- caracc_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_caracc_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_caracc_expected <- sum(
+  all_caracc_smr_data$expected_deaths
+)
+
+all_caracc_poisson <- poisson.test(
+  observed_caracc,
+  T = all_caracc_expected,
+  r = 1
+)
+
+all_caracc_results <- tibble(
+  cause = "Car accidents",
+  n_players = nrow(all_players),
+  observed_deaths = observed_caracc,
+  person_years = sum(
+    all_caracc_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_caracc_expected,
+  SMR = observed_caracc / all_caracc_expected,
+  lower_95_CI = all_caracc_poisson$conf.int[1],
+  upper_95_CI = all_caracc_poisson$conf.int[2],
+  p_value = all_caracc_poisson$p.value
+)
+
+all_caracc_results %>%
+  print(width = Inf)
+```
+
+# suicide all players sensitivity 
+```{r}
+all_suicide_smr_data <- suicide_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_suicide_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_suicide_expected <- sum(
+  all_suicide_smr_data$expected_deaths
+)
+
+all_suicide_poisson <- poisson.test(
+  observed_suicide,
+  T = all_suicide_expected,
+  r = 1
+)
+
+all_suicide_results <- tibble(
+  cause = "Suicide",
+  n_players = nrow(all_players),
+  observed_deaths = observed_suicide,
+  person_years = sum(
+    all_suicide_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_suicide_expected,
+  SMR = observed_suicide / all_suicide_expected,
+  lower_95_CI = all_suicide_poisson$conf.int[1],
+  upper_95_CI = all_suicide_poisson$conf.int[2],
+  p_value = all_suicide_poisson$p.value
+)
+
+all_suicide_results %>%
+  print(width = Inf)
+```
+
+# neuro all players sensitivity 
+```{r}
+all_neuro_smr_data <- neuro_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_neuro_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_neuro_expected <- sum(
+  all_neuro_smr_data$expected_deaths
+)
+
+all_neuro_poisson <- poisson.test(
+  observed_neuro,
+  T = all_neuro_expected,
+  r = 1
+)
+
+all_neuro_results <- tibble(
+  cause = "Neurodegenerative disease",
+  n_players = nrow(all_players),
+  observed_deaths = observed_neuro,
+  person_years = sum(
+    all_neuro_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_neuro_expected,
+  SMR = observed_neuro / all_neuro_expected,
+  lower_95_CI = all_neuro_poisson$conf.int[1],
+  upper_95_CI = all_neuro_poisson$conf.int[2],
+  p_value = all_neuro_poisson$p.value
+)
+
+all_neuro_results %>%
+  print(width = Inf)
+```
+
+# cancer with unconfirmed cases all players sensitivity 
+```{r}
+all_cancer_long_smr_data <- cancer_long_ref %>%
+  select(
+    agecat,
+    calendar,
+    ref_deaths = perioddeaths,
+    ref_person_years = periodpys
+  ) %>%
+  left_join(
+    all_soccer_strata %>%
+      select(
+        agecat,
+        calendar,
+        cohort_person_years
+      ),
+    by = c("agecat", "calendar")
+  ) %>%
+  mutate(
+    cohort_person_years =
+      coalesce(cohort_person_years, 0),
+
+    ref_mortality_rate =
+      ref_deaths / ref_person_years,
+
+    expected_deaths =
+      cohort_person_years * ref_mortality_rate
+  )
+
+all_cancer_long_smr_data %>%
+  summarise(
+    total_person_years =
+      sum(cohort_person_years),
+    total_expected_deaths =
+      sum(expected_deaths),
+    missing_expected =
+      sum(is.na(expected_deaths))
+  ) %>%
+  print(width = Inf)
+```
+
+```{r}
+all_cancer_long_expected <- sum(
+  all_cancer_long_smr_data$expected_deaths
+)
+
+all_cancer_long_poisson <- poisson.test(
+  observed_cancer_long,
+  T = all_cancer_long_expected,
+  r = 1
+)
+
+all_cancer_long_results <- tibble(
+  cause = "Cancer including unconfirmed cases",
+  n_players = nrow(all_players),
+  observed_deaths = observed_cancer_long,
+  person_years = sum(
+    all_cancer_long_smr_data$cohort_person_years
+  ),
+  expected_deaths = all_cancer_long_expected,
+  SMR = observed_cancer_long / all_cancer_long_expected,
+  lower_95_CI = all_cancer_long_poisson$conf.int[1],
+  upper_95_CI = all_cancer_long_poisson$conf.int[2],
+  p_value = all_cancer_long_poisson$p.value
+)
+
+all_cancer_long_results %>%
+  print(width = Inf)
+```
+
+
+```{r}
+all_covid_results <- covid_results %>%
+  mutate(
+    n_players = 5388
+  )
+
+all_covid_results %>%
+  print(width = Inf)
+```
+
+# all playesr sensitvity results combined 
+```{r}
+all_players_smr_results_combined <- bind_rows(
+
+  all_player_smr_results %>%
+    mutate(cause = "All-cause") %>%
+    select(
+      cause,
+      n_players,
+      observed_deaths,
+      person_years,
+      expected_deaths,
+      SMR,
+      lower_95_CI,
+      upper_95_CI,
+      p_value
+    ),
+
+  all_covid_results,
+  all_cardio_results,
+  all_cancer_results,
+  all_cancer_long_results,
+  all_caracc_results,
+  all_suicide_results,
+  all_neuro_results
+
+) %>%
+  mutate(
+    cause = factor(
+      cause,
+      levels = c(
+        "All-cause",
+        "COVID-19",
+        "Cardiovascular disease",
+        "Confirmed cancer",
+        "Cancer including unconfirmed cases",
+        "Car accidents",
+        "Suicide",
+        "Neurodegenerative disease"
+      )
+    )
+  ) %>%
+  arrange(cause)
+
+all_players_smr_results_combined %>%
+  print(width = Inf)
+```
+
+
+
+
+
+
+# save primary results to word doc
+```{r}
+# save primary SMR results to Word
+
+dir.create("results", showWarnings = FALSE)
+
+smr_primary_word <- smr_results_combined %>%
+  transmute(
+    Cause = as.character(cause),
+    N = n_players,
+    `Observed deaths` = observed_deaths,
+    `Person-years` = format(
+      round(person_years),
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+    `Expected deaths` = sprintf("%.1f", expected_deaths),
+    SMR = sprintf("%.3f", SMR),
+    `95% CI` = paste0(
+      sprintf("%.3f", lower_95_CI),
+      "–",
+      sprintf("%.3f", upper_95_CI)
+    ),
+    `p-value` = if_else(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  )
+
+ft_smr_primary <- flextable(smr_primary_word) |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  bold(part = "header") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+doc <- read_docx() |>
+  body_add_par(
+    "Standardized Mortality Ratios",
+    style = "Normal"
+  ) |>
+  body_add_flextable(ft_smr_primary)
+
+# print(
+#   doc,
+#   target = "results/SMR_primary_analysis.docx"
+# )
+```
+
+# save esordio table to word 
+```{r}
+# save career-start sensitivity SMR results to Word
+
+smr_career_word <- esordio_smr_results_combined %>%
+  transmute(
+    Cause = as.character(cause),
+    N = n_players,
+    `Observed deaths` = observed_deaths,
+    `Person-years` = format(
+      round(person_years),
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+    `Expected deaths` = sprintf("%.1f", expected_deaths),
+    SMR = sprintf("%.3f", SMR),
+    `95% CI` = paste0(
+      sprintf("%.3f", lower_95_CI),
+      "–",
+      sprintf("%.3f", upper_95_CI)
+    ),
+    `p-value` = if_else(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  )
+
+ft_smr_career <- flextable(smr_career_word) |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  bold(part = "header") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+doc <- read_docx() |>
+  body_add_par(
+    "Sensitivity Analysis: Follow-up Beginning at Professional Debut",
+    style = "Normal"
+  ) |>
+  body_add_flextable(ft_smr_career)
+
+# print(
+#   doc,
+#   target = "results/SMR_sensitivity_esordio.docx"
+# )
+```
+
+# save all players table to word 
+```{r}
+# save all-players sensitivity SMR results to Word
+
+smr_all_players_word <- all_players_smr_results_combined %>%
+  transmute(
+    Cause = as.character(cause),
+    N = n_players,
+    `Observed deaths` = observed_deaths,
+    `Person-years` = format(
+      round(person_years),
+      big.mark = ",",
+      scientific = FALSE,
+      trim = TRUE
+    ),
+    `Expected deaths` = sprintf("%.1f", expected_deaths),
+    SMR = sprintf("%.3f", SMR),
+    `95% CI` = paste0(
+      sprintf("%.3f", lower_95_CI),
+      "–",
+      sprintf("%.3f", upper_95_CI)
+    ),
+    `p-value` = if_else(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  )
+
+ft_smr_all_players <- flextable(smr_all_players_word) |>
+  fontsize(size = 10, part = "all") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  line_spacing(space = 1.15, part = "all") |>
+  bold(part = "header") |>
+  autofit() |>
+  set_table_properties(
+    layout = "autofit",
+    width = 1
+  )
+
+doc <- read_docx() |>
+  body_add_par(
+    "Sensitivity Analysis: Including Players with Partial Follow-up",
+    style = "Normal"
+  ) |>
+  body_add_flextable(ft_smr_all_players)
+
+# print(
+#   doc,
+#   target = "results/SMR_sensitivity_all_players.docx"
+# )
+```
+
+
+
+# SMR cardiovascular by age plot 
+```{r}
+# full follow up cohort 
+
+
+# 1. Expected cardiovascular deaths using NEW rebuilt person-time
+
+
+cardio_age_expected <- cardio_smr_data %>%
+  mutate(
+    age_group = case_when(
+      agecat <= 34 ~ "15-34",
+      agecat <= 54 ~ "35-54",
+      agecat <= 74 ~ "55-74",
+      agecat >= 75 ~ "75+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(age_group)) %>%
+  group_by(age_group) %>%
+  summarise(
+    person_years = sum(cohort_person_years, na.rm = TRUE),
+    expected_deaths = sum(expected_deaths, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# 2. Observed cardiovascular deaths by age group
+
+
+cardio_age_observed <- cardio_cohort_old %>%
+  mutate(
+    agecat = as.numeric(agecat),
+
+    age_group = case_when(
+      agecat <= 34 ~ "15-34",
+      agecat <= 54 ~ "35-54",
+      agecat <= 74 ~ "55-74",
+      agecat >= 75 ~ "75+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(age_group)) %>%
+  group_by(age_group) %>%
+  summarise(
+    observed_deaths = sum(perioddeaths, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# 3. Calculate age-specific SMRs and exact Poisson 95% CIs
+
+
+cardio_age_smr <- cardio_age_expected %>%
+  left_join(
+    cardio_age_observed,
+    by = "age_group"
+  ) %>%
+  mutate(
+    observed_deaths = coalesce(observed_deaths, 0)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    poisson_result = list(
+      poisson.test(
+        observed_deaths,
+        T = expected_deaths,
+        r = 1
+      )
+    ),
+
+    SMR = observed_deaths / expected_deaths,
+
+    lower_95_CI =
+      poisson_result$conf.int[1],
+
+    upper_95_CI =
+      poisson_result$conf.int[2],
+
+    p_value =
+      poisson_result$p.value
+  ) %>%
+  ungroup() %>%
+  select(-poisson_result) %>%
+  mutate(
+    age_group = factor(
+      age_group,
+      levels = c(
+        "15-34",
+        "35-54",
+        "55-74",
+        "75+"
+      )
+    )
+  ) %>%
+  arrange(age_group)
+
+
+# View the newly calculated values
+cardio_age_smr %>%
+  print(width = Inf)
+
+# 4. Plot
+
+ggplot(
+  cardio_age_smr,
+  aes(
+    x = age_group,
+    y = SMR
+  )
+) +
+  geom_hline(
+    yintercept = 1,
+    color = "red",
+    linewidth = 1
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = lower_95_CI,
+      ymax = upper_95_CI
+    ),
+    width = 0.08,
+    linewidth = 1,
+    color = "deepskyblue3"
+  ) +
+  geom_point(
+    size = 3,
+    color = "deepskyblue3"
+  ) +
+  labs(
+    title = "",
+    x = "Age (years)",
+    y = "Age-specific SMR"
+  ) +
+  scale_y_continuous(
+  breaks = seq(0, 2, by = 0.5),
+  expand = expansion(mult = c(0, 0.03))
+) +
+coord_cartesian(
+  ylim = c(-0.05, 2.0)
+) +
+  theme_classic(
+    base_size = 14
+  ) +
+  theme(
+    plot.title = element_text(
+      face = "plain",
+      size = 16
+    )
+  )
+```
+
