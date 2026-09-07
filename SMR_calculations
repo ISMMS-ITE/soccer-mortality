@@ -25,9 +25,9 @@ library(ggplot2)
 ```{r}
 retro_update6 <- read_sas(
   "sas_datafiles/retro_update6.sas7bdat"
-)
+) # github file: "deidentified_retro_update.csv"
 
-italy_ref = read.csv("sas_datafiles/Italy_Overall_Deaths.csv")
+italy_ref = read.csv("sas_datafiles/Italy_Overall_Deaths.csv") # github file: "italy_ref.csv"
 
 admin_end <- as.Date("2023-12-31")
 ref_start <- as.Date("1975-01-01")
@@ -466,9 +466,8 @@ smr_data <- smr_data %>%
   )
 ```
 
-# dervie the observed deaths from the soccer cohort 
+# derive the observed deaths from the soccer cohort 
 ```{r}
-# Derive observed deaths during SMR-eligible follow-up
 
 full_fu <- full_fu %>%
   mutate(
@@ -836,7 +835,7 @@ all_smr_data <- all_smr_data %>%
   )
 ```
 
-# dervie the observed deaths for the all-player SMR 
+# derive the observed deaths for the all-player SMR 
 ```{r}
 # Derive observed deaths during SMR-eligible follow-up
 # for the all-player cohort
@@ -924,7 +923,7 @@ all_player_smr_results
 covid_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_CovidRef_9.18.2024_IHME_2020.2021.xlsx"
-)
+) # github file: "covid_ref.csv"
 
 covid_ref <- read_excel(
   covid_file,
@@ -934,7 +933,7 @@ covid_ref <- read_excel(
 covid_cohort_old <- read_excel(
   covid_file,
   sheet = "COVID Cohort"
-)
+) # github file: "covid_cohort_old.csv"
 ```
 
 # calculate the eligible 2020-2021 follow-up window 
@@ -1225,7 +1224,7 @@ covid_results %>%
 cardio_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_CardioRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "cardio_ref.csv"
 
 excel_sheets(cardio_file)
 
@@ -1237,7 +1236,7 @@ cardio_ref <- read_excel(
 cardio_cohort_old <- read_excel(
   cardio_file,
   sheet = "Cardio Cohort"
-)
+) # github file "cardio_cohort_old.csv"
 ```
 
 # clean and QC the reference 
@@ -1357,7 +1356,7 @@ cardio_results %>%
 cancer_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_CancerRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "cancer_ref.csv"
 
 excel_sheets(cancer_file)
 
@@ -1369,7 +1368,7 @@ cancer_ref <- read_excel(
 cancer_cohort_old <- read_excel(
   cancer_file,
   sheet = "Cancer Cohort"
-)
+) # github file: "cancer_cohort_old.csv"
 ```
 
 # clean and QC the reference 
@@ -1489,7 +1488,7 @@ cancer_results %>%
 caracc_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_CarAccRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "caracc_ref.csv"
 
 excel_sheets(caracc_file)
 
@@ -1501,7 +1500,7 @@ caracc_ref <- read_excel(
 caracc_cohort_old <- read_excel(
   caracc_file,
   sheet = "CarAcc Cohort"
-)
+) # github file: "caracc_cohort_old.csv"
 ```
 
 # clean and QC the reference
@@ -1621,7 +1620,7 @@ caracc_results %>%
 suicide_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_SuicideRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "suicide_ref.csv"
 
 excel_sheets(suicide_file)
 
@@ -1633,7 +1632,7 @@ suicide_ref <- read_excel(
 suicide_cohort_old <- read_excel(
   suicide_file,
   sheet = "Suicide Cohort"
-)
+) # github file: "suicide_cohort_old.csv"
 ```
 
 # clean and QC the reference 
@@ -1753,7 +1752,7 @@ suicide_results %>%
 neuro_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_NeuroRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "neuro_ref.csv"
 
 excel_sheets(neuro_file)
 
@@ -1764,7 +1763,7 @@ neuro_ref <- read_excel(
 neuro_cohort_old = read_excel(
   neuro_file,
   sheet = "Neuro Cohort"
-)
+) # github file: "neuro_cohort_old.csv"
 ```
 
 # QC the reference 
@@ -1876,7 +1875,7 @@ neuro_results %>%
 cancer_long_file <- paste0(
   "sas_datafiles/",
   "ItalySoccer_CancerwLongDisRef_9.18.2024_IHME_1975.2023.xlsx"
-)
+) # github file: "cancer_long_ref.csv"
 
 excel_sheets(cancer_long_file)
 
@@ -1888,7 +1887,7 @@ cancer_long_ref <- read_excel(
 cancer_long_cohort_old <- read_excel(
   cancer_long_file,
   sheet = "Cancer Long Cohort"
-)
+) # github file: "cancer_long_cohort_old.csv"
 
 cancer_long_cohort_old <- cancer_long_cohort_old %>%
   filter(
