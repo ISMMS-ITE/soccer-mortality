@@ -118,7 +118,7 @@ analysis_complete %>%
   print(width = Inf)
 ```
 
-# cox models 
+# univaribale cox models 
 ```{r}
 # Univariable Cox proportional hazards models
 
@@ -160,97 +160,8 @@ cox.zph(cox_games)
 cox.zph(cox_position)
 
 
-# Create publication-style univariable table
-# Clean univariable Cox regression table
-tbl_univariable <- analysis_complete %>%
-  select(
-  followup_years_birth,
-  death,
-  BMI,
-  CareerLength,
-  games_50,
-  position_clean
-) %>%
-  tbl_uvregression(
-    method = coxph,
-    y = Surv(followup_years_birth, death),
-    include = c(
-  BMI,
-  CareerLength,
-  games_50,
-  position_clean
-),
-    exponentiate = TRUE,
-    label = list(
-      BMI ~ "BMI (kg/m²)",
-      CareerLength ~ "Length of career (years)",
-      games_50 ~ "No. of official games played (per 50 games)",
-      position_clean ~ "Position"
-    )
-  ) %>%
-  add_global_p(
-  include = position_clean
-) %>%
-  modify_table_body(
-    ~ .x %>%
-      mutate(
-        label = if_else(
-          label == "Forward",
-          "Forward (Reference)",
-          label
-        )
-      )
-  ) %>%
- modify_header(
-  label ~ "**Variable**",
-  estimate ~ "**Hazard Ratio**",
-  conf.low ~ "**95% CI**",
-  p.value ~ "**P-value**"
-)
-
-tbl_univariable
-```
-
-# save to word 
+# multivariable cox models
 ```{r}
-# save univariable analysis table to Word
-
-dir.create("results", showWarnings = FALSE)
-
-ft_univariable <- tbl_univariable |>
-  as_flex_table() |>
-  fontsize(size = 10, part = "all") |>
-  font(fontname = "Times New Roman", part = "all") |>
-  line_spacing(space = 1.15, part = "all") |>
-  autofit() |>
-  set_table_properties(
-    layout = "autofit",
-    width = 1
-  )
-
-doc <- read_docx() |>
-  body_add_par("Univariable Cox Regression Analyses", style = "Normal") |>
-  body_add_flextable(ft_univariable)
-
-# print(
-#   doc,
-#   target = "results/univariable_cox_regression_table.docx"
-# )
-```
-
-
-
-
-
-
-
-# multivariable models
-```{r}
-# ============================================================
-# MULTIVARIABLE COX PROPORTIONAL HAZARDS MODELS
-# Survival time measured FROM BIRTH
-# ============================================================
-
 library(lubridate)
 
 # Add age/year at beginning of professional career
@@ -270,10 +181,7 @@ analysis_complete <- analysis_complete %>%
       as.numeric(career_start_date - DOB) / 365.25
   )
 
-
-# ------------------------------------------------------------
 # QC
-# ------------------------------------------------------------
 
 analysis_complete %>%
   summarise(
@@ -302,11 +210,10 @@ analysis_complete %>%
   print(width = Inf)
 
 
-# ============================================================
 # MODEL 1
 # BMI + position + age at beginning of career +
 # year beginning career + games played per 50
-# ============================================================
+
 
 cox_multi_1 <- coxph(
   Surv(followup_years_birth, death) ~
@@ -321,11 +228,9 @@ cox_multi_1 <- coxph(
 summary(cox_multi_1)
 
 
-# ============================================================
 # MODEL 2
 # BMI + position + age at beginning of career +
 # year beginning career + career length
-# ============================================================
 
 cox_multi_2 <- coxph(
   Surv(followup_years_birth, death) ~
@@ -340,147 +245,8 @@ cox_multi_2 <- coxph(
 summary(cox_multi_2)
 
 
-# ------------------------------------------------------------
 # Proportional hazards assumption
-# ------------------------------------------------------------
 
 cox.zph(cox_multi_1)
 cox.zph(cox_multi_2)
-
-
-# ------------------------------------------------------------
-# Publication-style table: Model 1
-# ------------------------------------------------------------
-
-tbl_multi_1 <- tbl_regression(
-  cox_multi_1,
-  exponentiate = TRUE,
-  label = list(
-    BMI ~ "BMI (kg/m²)",
-    position_clean ~ "Position",
-    age_start_career ~ "Age at beginning of career (years)",
-    career_start_year ~ "Year of beginning of career",
-    games_50 ~ "No. of official games played (per 50 games)"
-  )
-) %>%
-  add_global_p(
-    include = position_clean
-  ) %>%
-  modify_table_body(
-    ~ .x %>%
-      mutate(
-        label = if_else(
-          label == "Forward",
-          "Forward (Reference)",
-          label
-        )
-      )
-  ) %>%
-  modify_header(
-    label ~ "**Variable**",
-    estimate ~ "**Hazard Ratio**",
-    conf.low ~ "**95% CI**",
-    p.value ~ "**P-value**"
-  )
-
-
-tbl_multi_2 <- tbl_regression(
-  cox_multi_2,
-  exponentiate = TRUE,
-  label = list(
-    BMI ~ "BMI (kg/m²)",
-    position_clean ~ "Position",
-    age_start_career ~ "Age at beginning of career (years)",
-    career_start_year ~ "Year of beginning of career",
-    CareerLength ~ "Length of career (years)"
-  )
-) %>%
-  add_global_p(
-    include = position_clean
-  ) %>%
-  modify_table_body(
-    ~ .x %>%
-      mutate(
-        label = if_else(
-          label == "Forward",
-          "Forward (Reference)",
-          label
-        )
-      )
-  ) %>%
-  modify_header(
-    label ~ "**Variable**",
-    estimate ~ "**Hazard Ratio**",
-    conf.low ~ "**95% CI**",
-    p.value ~ "**P-value**"
-  )
-
-
-# View tables
-tbl_multi_1
-tbl_multi_2
-
-
-# ------------------------------------------------------------
-# Combine Model 1 and Model 2 side-by-side
-# ------------------------------------------------------------
-
-tbl_multivariable_combined <- tbl_merge(
-  tbls = list(
-    tbl_multi_1,
-    tbl_multi_2
-  ),
-  tab_spanner = c(
-    "**Model 1: Total games**",
-    "**Model 2: Career length**"
-  )
-)
-
-tbl_multivariable_combined
 ```
-
-# save combined models table as word
-```{r}
-dir.create("results", showWarnings = FALSE)
-
-# Convert the final side-by-side gtsummary table to flextable
-ft_multivariable <- tbl_multivariable_combined |>
-  as_flex_table() |>
-  fontsize(size = 10, part = "all") |>
-  font(fontname = "Times New Roman", part = "all") |>
-  line_spacing(space = 1.15, part = "all") |>
-  autofit() |>
-  set_table_properties(
-    layout = "autofit",
-    width = 1
-  )
-
-# Landscape page setup because the two-model table is wide
-landscape_section <- prop_section(
-  page_size = page_size(orient = "landscape"),
-  page_margins = page_mar(
-    top = 0.5,
-    bottom = 0.5,
-    left = 0.5,
-    right = 0.5
-  )
-)
-
-# Create Word document
-doc_multivariable <- read_docx() |>
-  body_add_par(
-    "Multivariable Cox Regression Analyses",
-    style = "Normal"
-  ) |>
-  body_add_flextable(ft_multivariable) |>
-  body_set_default_section(
-    value = landscape_section
-  )
-
-# # Save
-# print(
-#   doc_multivariable,
-#   target = "results/multivariable_cox_regression_table.docx"
-# )
-```
-
