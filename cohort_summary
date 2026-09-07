@@ -16,7 +16,7 @@ library(gtsummary)
 
 # load retro update 6
 ```{r}
-retro_update6 <- read_sas("sas_datafiles/retro_update6.sas7bdat")
+retro_update6 <- read_sas("sas_datafiles/retro_update6.sas7bdat") # github file "deidentified_retro_update.csv"
 ```
 
 # reconstruct descriptive follow-up variables 
